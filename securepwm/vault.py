@@ -17,27 +17,34 @@ import sqlite3
 import os
 import time
 import uuid
+import json
 from typing import Optional, List, Dict
 
 from . import crypto
 
 
 # =============================================================================
-# DATABASE SCHEMA
+# DATABASE SCHEMA (Per docs/data-model.md)
 # =============================================================================
 
 SCHEMA = """
--- Vault metadata (one row)
-CREATE TABLE IF NOT EXISTS vault_meta (
+-- Vault state (crypto parameters and versioning) - one row
+CREATE TABLE IF NOT EXISTS vault_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     vault_id TEXT NOT NULL,
-    salt BLOB NOT NULL,
-    created_at INTEGER NOT NULL
+    schema_version INTEGER NOT NULL DEFAULT 1,
+    kdf TEXT NOT NULL,                -- "scrypt"
+    kdf_params TEXT NOT NULL,         -- JSON: {"N": 131072, "r": 8, "p": 1, "dkLen": 32}
+    kdf_salt BLOB NOT NULL,           -- 16-32 bytes random
+    aead_algo TEXT NOT NULL,          -- "aes256gcm"
+    created_at INTEGER NOT NULL,
+    last_unlock_at INTEGER
 );
 
 -- Password entries (all encrypted)
 CREATE TABLE IF NOT EXISTS entries (
     id TEXT PRIMARY KEY,
+    version INTEGER NOT NULL DEFAULT 1,
     -- Entry key (wrapped/encrypted)
     key_nonce BLOB NOT NULL,
     key_wrapped BLOB NOT NULL,
@@ -50,14 +57,23 @@ CREATE TABLE IF NOT EXISTS entries (
     deleted INTEGER DEFAULT 0
 );
 
--- Audit log (tamper-evident chain)
+-- Audit log (tamper-evident chain with full binding)
 CREATE TABLE IF NOT EXISTS audit_log (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
-    timestamp INTEGER NOT NULL,
+    ts INTEGER NOT NULL,
     action TEXT NOT NULL,
+    payload BLOB,
     prev_mac BLOB,
     mac BLOB NOT NULL
 );
+"""
+
+# SQLite PRAGMAs for crash safety and integrity (per docs/data-model.md)
+PRAGMAS = """
+PRAGMA journal_mode=WAL;
+PRAGMA synchronous=FULL;
+PRAGMA foreign_keys=ON;
+PRAGMA secure_delete=ON;
 """
 
 
@@ -99,6 +115,9 @@ class Vault:
         self.conn: Optional[sqlite3.Connection] = None
         self.vault_id: Optional[str] = None
         self.salt: Optional[bytes] = None
+        self.schema_version: int = 1
+        self.kdf_params: Optional[dict] = None
+        self.aead_algo: str = "aes256gcm"
 
         # Keys (only present when unlocked)
         self.vault_key: Optional[bytes] = None
@@ -111,10 +130,11 @@ class Vault:
         Create a new vault with master password.
 
         This:
-        1. Creates database
+        1. Creates database with crash-safety PRAGMAs
         2. Generates random salt
-        3. Derives keys from master password
-        4. Records initialization in audit log
+        3. Stores KDF and AEAD parameters
+        4. Derives keys from master password
+        5. Records initialization in audit log
 
         Args:
             master_password: User's master password
@@ -130,17 +150,33 @@ class Vault:
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row  # Access columns by name
 
+        # Apply PRAGMAs for crash safety and integrity
+        self.conn.executescript(PRAGMAS)
+
         # Create tables
         self.conn.executescript(SCHEMA)
 
         # Generate salt and vault ID
         self.salt = os.urandom(16)
         self.vault_id = str(uuid.uuid4())
+        self.schema_version = 1
+        self.aead_algo = "aes256gcm"
 
-        # Save vault metadata
+        # Store KDF parameters (from crypto module defaults)
+        self.kdf_params = {
+            "N": crypto.SCRYPT_N,
+            "r": crypto.SCRYPT_R,
+            "p": crypto.SCRYPT_P,
+            "dkLen": 32
+        }
+
+        # Save vault state with crypto parameters
         self.conn.execute(
-            "INSERT INTO vault_meta (id, vault_id, salt, created_at) VALUES (1, ?, ?, ?)",
-            (self.vault_id, self.salt, int(time.time()))
+            """INSERT INTO vault_state
+               (id, vault_id, schema_version, kdf, kdf_params, kdf_salt, aead_algo, created_at)
+               VALUES (1, ?, ?, ?, ?, ?, ?, ?)""",
+            (self.vault_id, self.schema_version, "scrypt",
+             json.dumps(self.kdf_params), self.salt, self.aead_algo, int(time.time()))
         )
         self.conn.commit()
 
@@ -156,6 +192,9 @@ class Vault:
         """
         Unlock existing vault with master password.
 
+        Loads vault state including crypto parameters and uses them
+        to derive keys. Updates last_unlock_at timestamp.
+
         Args:
             master_password: User's master password
 
@@ -170,16 +209,29 @@ class Vault:
         self.conn = sqlite3.connect(self.db_path)
         self.conn.row_factory = sqlite3.Row
 
-        # Load vault metadata
-        row = self.conn.execute("SELECT * FROM vault_meta WHERE id = 1").fetchone()
+        # Apply PRAGMAs
+        self.conn.executescript(PRAGMAS)
+
+        # Load vault state (includes crypto parameters)
+        row = self.conn.execute("SELECT * FROM vault_state WHERE id = 1").fetchone()
         if not row:
             raise Exception("Vault not initialized")
 
         self.vault_id = row['vault_id']
-        self.salt = row['salt']
+        self.salt = row['kdf_salt']
+        self.schema_version = row['schema_version']
+        self.aead_algo = row['aead_algo']
+        self.kdf_params = json.loads(row['kdf_params'])
 
-        # Derive keys
+        # Derive keys using stored parameters
         self._derive_keys(master_password)
+
+        # Update last unlock timestamp
+        self.conn.execute(
+            "UPDATE vault_state SET last_unlock_at = ? WHERE id = 1",
+            (int(time.time()),)
+        )
+        self.conn.commit()
 
         # Log unlock
         self._audit("VAULT_UNLOCK")
@@ -235,26 +287,39 @@ class Vault:
         # Generate entry ID and key
         entry_id = str(uuid.uuid4())
         entry_key = crypto.create_entry_key()
-
-        # Encrypt the secret content
-        content_nonce, content_ct = crypto.encrypt_entry_content(
-            entry_key, secret, entry_id
-        )
-
-        # Wrap the entry key
-        key_nonce, key_wrapped = crypto.wrap_entry_key(
-            self.content_key, entry_key, entry_id
-        )
-
-        # Store in database
+        entry_version = 1
         now = int(time.time())
+
+        # Encrypt the secret content with full AD binding
+        content_nonce, content_ct = crypto.encrypt_entry_content(
+            entry_key,
+            secret,
+            self.vault_id,
+            entry_id,
+            now,  # created_at
+            now,  # updated_at
+            self.schema_version,
+            entry_version
+        )
+
+        # Wrap the entry key with full AD binding
+        key_nonce, key_wrapped = crypto.wrap_entry_key(
+            self.content_key,
+            entry_key,
+            self.vault_id,
+            entry_id,
+            self.schema_version,
+            entry_version
+        )
+
+        # Store in database (including version field)
         self.conn.execute(
             """
-            INSERT INTO entries (id, key_nonce, key_wrapped, content_nonce,
+            INSERT INTO entries (id, version, key_nonce, key_wrapped, content_nonce,
                                 content_ciphertext, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (entry_id, key_nonce, key_wrapped, content_nonce, content_ct, now, now)
+            (entry_id, entry_version, key_nonce, key_wrapped, content_nonce, content_ct, now, now)
         )
         self.conn.commit()
 
@@ -298,20 +363,28 @@ class Vault:
         if not row:
             raise Exception(f"Entry {entry_id} not found")
 
-        # Unwrap entry key
+        # Unwrap entry key with full AD binding
         entry_key = crypto.unwrap_entry_key(
             self.content_key,
             row['key_nonce'],
             row['key_wrapped'],
-            entry_id
+            self.vault_id,
+            entry_id,
+            self.schema_version,
+            row['version']
         )
 
-        # Decrypt content
+        # Decrypt content with full AD binding
         secret = crypto.decrypt_entry_content(
             entry_key,
             row['content_nonce'],
             row['content_ciphertext'],
-            entry_id
+            self.vault_id,
+            entry_id,
+            row['created_at'],
+            row['updated_at'],
+            self.schema_version,
+            row['version']
         )
 
         # Log access
@@ -380,9 +453,9 @@ class Vault:
         """
         self._require_unlocked()
 
-        # Load all audit entries
+        # Load all audit entries (including ts and payload for new MAC verification)
         rows = self.conn.execute(
-            "SELECT seq, action, prev_mac, mac FROM audit_log ORDER BY seq"
+            "SELECT seq, ts, action, payload, prev_mac, mac FROM audit_log ORDER BY seq"
         ).fetchall()
 
         entries = [dict(row) for row in rows]
@@ -404,23 +477,40 @@ class Vault:
         self.audit_key = subkeys['audit_key']
         self.recovery_key = subkeys['recovery_key']
 
-    def _audit(self, action: str) -> None:
-        """Add entry to audit log."""
-        # Get previous MAC
+    def _audit(self, action: str, payload: Optional[bytes] = None) -> None:
+        """
+        Add entry to audit log with full binding.
+
+        CRITICAL FIX: Now selects BOTH seq and mac from previous entry.
+        Also includes timestamp and payload in MAC computation per spec.
+
+        Args:
+            action: Action identifier (e.g., "VAULT_INIT", "ENTRY_ADD")
+            payload: Optional payload bytes to authenticate
+        """
+        # Get previous entry (MUST select both seq and mac!)
         prev_row = self.conn.execute(
-            "SELECT mac FROM audit_log ORDER BY seq DESC LIMIT 1"
+            "SELECT seq, mac FROM audit_log ORDER BY seq DESC LIMIT 1"
         ).fetchone()
 
-        prev_mac = prev_row['mac'] if prev_row else None
-        seq = (prev_row['seq'] + 1) if prev_row else 1
+        # Compute next sequence number
+        if prev_row:
+            prev_mac = prev_row['mac']
+            seq = prev_row['seq'] + 1
+        else:
+            prev_mac = None
+            seq = 1
 
-        # Compute new MAC
-        mac = crypto.compute_audit_mac(self.audit_key, seq, action, prev_mac)
+        # Current timestamp
+        ts = int(time.time())
 
-        # Store
+        # Compute new MAC with full binding (seq, ts, action, payload, prev_mac)
+        mac = crypto.compute_audit_mac(self.audit_key, seq, ts, action, prev_mac, payload)
+
+        # Store in audit log (using 'ts' column name per new schema)
         self.conn.execute(
-            "INSERT INTO audit_log (timestamp, action, prev_mac, mac) VALUES (?, ?, ?, ?)",
-            (int(time.time()), action, prev_mac, mac)
+            "INSERT INTO audit_log (ts, action, payload, prev_mac, mac) VALUES (?, ?, ?, ?, ?)",
+            (ts, action, payload, prev_mac, mac)
         )
         self.conn.commit()
 

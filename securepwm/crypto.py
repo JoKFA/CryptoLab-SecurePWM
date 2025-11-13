@@ -121,7 +121,42 @@ def derive_subkeys(vault_key: bytes) -> Dict[str, bytes]:
 
 
 # =============================================================================
-# PART 2: ENCRYPTION (AES-256-GCM)
+# PART 2: CANONICAL ASSOCIATED DATA (AD) - Per Spec
+# =============================================================================
+
+def canonical_ad(ad: dict) -> bytes:
+    """
+    Convert associated data to canonical JSON bytes (RFC 8785 style).
+
+    Why canonical?
+    - Same AD dict ALWAYS produces same bytes
+    - Deterministic across platforms
+    - Required for decryption to work
+
+    Format:
+    - Keys sorted lexicographically
+    - No whitespace (compact)
+    - UTF-8 encoding without escaping non-ASCII
+    - separators=(",", ":") for compact JSON
+
+    Args:
+        ad: Dictionary with required fields (depends on context)
+
+    Returns:
+        UTF-8 encoded canonical JSON bytes
+
+    Example:
+        >>> ad = {"ctx": "entry_content", "entry_id": "123", "vault_id": "456"}
+        >>> canonical_ad(ad)
+        b'{"ctx":"entry_content","entry_id":"123","vault_id":"456"}'
+    """
+    # Canonical JSON: sorted keys, compact, UTF-8
+    json_str = json.dumps(ad, separators=(",", ":"), sort_keys=True, ensure_ascii=False)
+    return json_str.encode('utf-8')
+
+
+# =============================================================================
+# PART 3: ENCRYPTION (AES-256-GCM)
 # =============================================================================
 
 def encrypt(key: bytes, plaintext: bytes, associated_data: dict) -> Tuple[bytes, bytes]:
@@ -136,8 +171,7 @@ def encrypt(key: bytes, plaintext: bytes, associated_data: dict) -> Tuple[bytes,
     Args:
         key: 32-byte encryption key
         plaintext: Data to encrypt
-        associated_data: Context dict (e.g., {"entry_id": "123"})
-                        This is authenticated but NOT encrypted
+        associated_data: Context dict (MUST include required fields per spec)
 
     Returns:
         (nonce, ciphertext) tuple
@@ -146,15 +180,16 @@ def encrypt(key: bytes, plaintext: bytes, associated_data: dict) -> Tuple[bytes,
 
     Example:
         >>> key = os.urandom(32)
-        >>> nonce, ct = encrypt(key, b"secret", {"id": "123"})
+        >>> ad = {"ctx": "test", "vault_id": "v1", "entry_id": "e1"}
+        >>> nonce, ct = encrypt(key, b"secret", ad)
         >>> len(nonce)
         12
     """
     # Generate random nonce (NEVER reuse with same key!)
     nonce = os.urandom(NONCE_SIZE)
 
-    # Convert associated data to bytes (deterministic JSON)
-    ad_bytes = json.dumps(associated_data, sort_keys=True).encode('utf-8')
+    # Convert associated data to canonical bytes
+    ad_bytes = canonical_ad(associated_data)
 
     # Encrypt with AES-256-GCM
     aesgcm = AESGCM(key)
@@ -180,11 +215,12 @@ def decrypt(key: bytes, nonce: bytes, ciphertext: bytes, associated_data: dict) 
         Exception: If tampered, wrong key, or wrong associated data
 
     Example:
-        >>> plaintext = decrypt(key, nonce, ct, {"id": "123"})
+        >>> ad = {"ctx": "test", "vault_id": "v1", "entry_id": "e1"}
+        >>> plaintext = decrypt(key, nonce, ct, ad)
         >>> plaintext
         b"secret"
     """
-    ad_bytes = json.dumps(associated_data, sort_keys=True).encode('utf-8')
+    ad_bytes = canonical_ad(associated_data)
 
     aesgcm = AESGCM(key)
     plaintext = aesgcm.decrypt(nonce, ciphertext, ad_bytes)
@@ -193,7 +229,7 @@ def decrypt(key: bytes, nonce: bytes, ciphertext: bytes, associated_data: dict) 
 
 
 # =============================================================================
-# PART 3: VAULT OPERATIONS (High-Level)
+# PART 4: VAULT OPERATIONS (High-Level with Full AD Binding)
 # =============================================================================
 
 def create_entry_key() -> bytes:
@@ -210,7 +246,14 @@ def create_entry_key() -> bytes:
     return os.urandom(VAULT_KEY_SIZE)
 
 
-def wrap_entry_key(content_key: bytes, entry_key: bytes, entry_id: str) -> Tuple[bytes, bytes]:
+def wrap_entry_key(
+    content_key: bytes,
+    entry_key: bytes,
+    vault_id: str,
+    entry_id: str,
+    schema_version: int = 1,
+    entry_version: int = 1
+) -> Tuple[bytes, bytes]:
     """
     Encrypt (wrap) an entry key using the content key.
 
@@ -218,90 +261,219 @@ def wrap_entry_key(content_key: bytes, entry_key: bytes, entry_id: str) -> Tuple
     - Entry key encrypts the actual password
     - Content key encrypts the entry key
 
-    Why?
-    - Can change master password without re-encrypting all passwords
-    - Just re-wrap the entry keys with new content key
+    Associated Data (prevents context confusion):
+    - ctx: "ke_wrap" (identifies this as key wrapping)
+    - vault_id: Which vault this belongs to
+    - entry_id: Which entry this key is for
+    - aead: "aes256gcm" (algorithm used)
+    - schema_version: Database schema version
+    - entry_version: Entry version (for updates)
+
+    Why full AD binding?
+    - Prevents using wrapped key in wrong context
+    - Detects if metadata changes
+    - Binds to specific vault and entry
 
     Args:
         content_key: From derive_subkeys()
         entry_key: Random key for this entry
-        entry_id: UUID of entry (included in associated data)
+        vault_id: UUID of vault
+        entry_id: UUID of entry
+        schema_version: Current schema version
+        entry_version: Entry version number
 
     Returns:
         (nonce, wrapped_key) - both must be stored in database
     """
-    return encrypt(content_key, entry_key, {"purpose": "entry_key", "entry_id": entry_id})
+    ad = {
+        "ctx": "ke_wrap",
+        "vault_id": vault_id,
+        "entry_id": entry_id,
+        "aead": "aes256gcm",
+        "schema_version": schema_version,
+        "entry_version": entry_version
+    }
+    return encrypt(content_key, entry_key, ad)
 
 
-def unwrap_entry_key(content_key: bytes, nonce: bytes, wrapped_key: bytes, entry_id: str) -> bytes:
+def unwrap_entry_key(
+    content_key: bytes,
+    nonce: bytes,
+    wrapped_key: bytes,
+    vault_id: str,
+    entry_id: str,
+    schema_version: int = 1,
+    entry_version: int = 1
+) -> bytes:
     """
     Decrypt (unwrap) an entry key.
+
+    AD MUST match wrap exactly or decryption fails.
 
     Returns:
         32-byte entry key
     """
-    return decrypt(content_key, nonce, wrapped_key, {"purpose": "entry_key", "entry_id": entry_id})
+    ad = {
+        "ctx": "ke_wrap",
+        "vault_id": vault_id,
+        "entry_id": entry_id,
+        "aead": "aes256gcm",
+        "schema_version": schema_version,
+        "entry_version": entry_version
+    }
+    return decrypt(content_key, nonce, wrapped_key, ad)
 
 
-def encrypt_entry_content(entry_key: bytes, content: bytes, entry_id: str) -> Tuple[bytes, bytes]:
+def encrypt_entry_content(
+    entry_key: bytes,
+    content: bytes,
+    vault_id: str,
+    entry_id: str,
+    created_at: int,
+    updated_at: int,
+    schema_version: int = 1,
+    entry_version: int = 1
+) -> Tuple[bytes, bytes]:
     """
     Encrypt password/secret content for an entry.
+
+    Associated Data (prevents rollback/tampering):
+    - ctx: "entry_content"
+    - vault_id, entry_id: Identity binding
+    - aead: Algorithm identifier
+    - schema_version, entry_version: Version binding
+    - created_at, updated_at: Timestamp binding
+
+    Why include timestamps in AD?
+    - Prevents rollback attacks (can't use old ciphertext)
+    - Binds ciphertext to its metadata
+    - Detects tampering with timestamps
 
     Args:
         entry_key: Unwrapped entry key
         content: The actual secret (password, note, etc.)
+        vault_id: UUID of vault
         entry_id: UUID of entry
+        created_at: Creation timestamp (Unix seconds)
+        updated_at: Last update timestamp (Unix seconds)
+        schema_version: Current schema version
+        entry_version: Entry version number
 
     Returns:
         (nonce, ciphertext) to store in database
     """
-    return encrypt(entry_key, content, {"purpose": "content", "entry_id": entry_id})
+    ad = {
+        "ctx": "entry_content",
+        "vault_id": vault_id,
+        "entry_id": entry_id,
+        "aead": "aes256gcm",
+        "schema_version": schema_version,
+        "entry_version": entry_version,
+        "created_at": created_at,
+        "updated_at": updated_at
+    }
+    return encrypt(entry_key, content, ad)
 
 
-def decrypt_entry_content(entry_key: bytes, nonce: bytes, ciphertext: bytes, entry_id: str) -> bytes:
+def decrypt_entry_content(
+    entry_key: bytes,
+    nonce: bytes,
+    ciphertext: bytes,
+    vault_id: str,
+    entry_id: str,
+    created_at: int,
+    updated_at: int,
+    schema_version: int = 1,
+    entry_version: int = 1
+) -> bytes:
     """
     Decrypt password/secret content.
+
+    AD MUST match encrypt exactly.
 
     Returns:
         Plaintext secret
     """
-    return decrypt(entry_key, nonce, ciphertext, {"purpose": "content", "entry_id": entry_id})
+    ad = {
+        "ctx": "entry_content",
+        "vault_id": vault_id,
+        "entry_id": entry_id,
+        "aead": "aes256gcm",
+        "schema_version": schema_version,
+        "entry_version": entry_version,
+        "created_at": created_at,
+        "updated_at": updated_at
+    }
+    return decrypt(entry_key, nonce, ciphertext, ad)
 
 
 # =============================================================================
-# PART 4: AUDIT LOG (Tamper Detection)
+# PART 5: AUDIT LOG (Tamper Detection with Full Binding)
 # =============================================================================
 
-def compute_audit_mac(audit_key: bytes, seq: int, action: str, prev_mac: Optional[bytes]) -> bytes:
+def compute_audit_mac(
+    audit_key: bytes,
+    seq: int,
+    ts: int,
+    action: str,
+    prev_mac: Optional[bytes],
+    payload: Optional[bytes] = None
+) -> bytes:
     """
-    Compute HMAC for an audit log entry.
+    Compute HMAC for an audit log entry with full binding.
 
     How it works:
     - Each entry's MAC includes the previous entry's MAC
     - Creates a chain: MAC1 → MAC2 → MAC3 → ...
     - Any tampering breaks the chain
 
+    What's authenticated (prevents tampering):
+    - seq: Sequence number (prevents reordering)
+    - ts: Timestamp (prevents backdating)
+    - action: What happened (prevents action changes)
+    - payload_hash: Hash of encrypted payload if present
+    - prev_mac: Previous MAC (creates chain)
+
+    Why include timestamp and payload?
+    - Timestamp: Prevents backdating/forward-dating attacks
+    - Payload hash: Authenticates any associated data
+    - Together: Full audit trail integrity
+
     Args:
         audit_key: From derive_subkeys()
         seq: Sequence number (1, 2, 3, ...)
-        action: What happened (e.g., "ADD_ENTRY", "UNLOCK")
+        ts: Timestamp (Unix seconds)
+        action: What happened (e.g., "ENTRY_ADD", "VAULT_UNLOCK")
         prev_mac: Previous entry's MAC (None for first entry)
+        payload: Optional payload bytes to authenticate
 
     Returns:
         32-byte HMAC
 
     Example:
         >>> audit_key = os.urandom(32)
-        >>> mac1 = compute_audit_mac(audit_key, 1, "INIT", None)
-        >>> mac2 = compute_audit_mac(audit_key, 2, "ADD", mac1)
+        >>> import time
+        >>> ts = int(time.time())
+        >>> mac1 = compute_audit_mac(audit_key, 1, ts, "INIT", None)
+        >>> mac2 = compute_audit_mac(audit_key, 2, ts+1, "ADD", mac1, b"data")
     """
-    # Build message to authenticate
+    # Compute payload hash if payload provided
+    if payload:
+        payload_hash = hashlib.sha256(payload).hexdigest()
+    else:
+        payload_hash = ""
+
+    # Build message to authenticate (canonical JSON)
     message = {
         "seq": seq,
+        "ts": ts,
         "action": action,
-        "prev": prev_mac.hex() if prev_mac else ""
+        "payload_hash": payload_hash,
+        "prev_mac": prev_mac.hex() if prev_mac else ""
     }
-    message_bytes = json.dumps(message, sort_keys=True).encode('utf-8')
+
+    # Use canonical AD (same as AEAD operations)
+    message_bytes = canonical_ad(message)
 
     # Compute HMAC-SHA256
     return hmac.new(audit_key, message_bytes, hashlib.sha256).digest()
@@ -313,15 +485,15 @@ def verify_audit_chain(audit_key: bytes, entries: list) -> bool:
 
     Args:
         audit_key: From derive_subkeys()
-        entries: List of dicts with keys: seq, action, mac, prev_mac
+        entries: List of dicts with keys: seq, ts, action, payload, mac, prev_mac
 
     Returns:
         True if chain is valid, False if tampered
 
     Example:
         >>> entries = [
-        ...     {"seq": 1, "action": "INIT", "prev_mac": None, "mac": mac1},
-        ...     {"seq": 2, "action": "ADD", "prev_mac": mac1, "mac": mac2}
+        ...     {"seq": 1, "ts": 1234, "action": "INIT", "payload": None, "prev_mac": None, "mac": mac1},
+        ...     {"seq": 2, "ts": 1235, "action": "ADD", "payload": b"data", "prev_mac": mac1, "mac": mac2}
         ... ]
         >>> verify_audit_chain(audit_key, entries)
         True
@@ -333,11 +505,13 @@ def verify_audit_chain(audit_key: bytes, entries: list) -> bool:
         expected_mac = compute_audit_mac(
             audit_key,
             entry["seq"],
+            entry["ts"],
             entry["action"],
-            prev_mac
+            prev_mac,
+            entry.get("payload")
         )
 
-        # Check if it matches stored MAC
+        # Check if it matches stored MAC (constant-time comparison)
         if not hmac.compare_digest(expected_mac, entry["mac"]):
             return False  # Tampered!
 
