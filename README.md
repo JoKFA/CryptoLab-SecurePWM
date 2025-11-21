@@ -85,12 +85,12 @@ Any tampering breaks the chain and is detected instantly.
 
 ```
 securepwm/
-├── crypto.py       (~350 lines) - ALL cryptographic operations
-├── vault.py        (~300 lines) - SQLite database + operations
-├── recovery.py     (~150 lines) - Shamir Secret Sharing
-└── cli.py          (~200 lines) - Command-line interface
+├── crypto.py   - ALL cryptographic operations
+├── vault.py    - SQLite database + operations
+├── recovery.py - Shamir Secret Sharing
 
-Total: ~1000 lines of clear, commented code
+spwm_main.py    - Main CLI interface program
+
 ```
 
 ### Dependencies (MINIMAL!)
@@ -100,8 +100,6 @@ cryptography    - AES-GCM, scrypt, HKDF (industry standard)
 shamir-mnemonic - Shamir Secret Sharing (k-of-n recovery)
 pytest          - Testing (dev only)
 ```
-
-**That's it!** No fancy frameworks, no bloat.
 
 ---
 
