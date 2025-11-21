@@ -1,13 +1,11 @@
 # SecurePWM - Zero-Knowledge Password Manager
-## Simplified Educational Version
-
-**A minimal, secure, and understandable password manager for academic purposes.**
 
 ---
 
 ## 🎯 Project Overview
 
-This is a **simplified, educational implementation** of a zero-knowledge password manager. It demonstrates enterprise-grade security concepts in ~1000 lines of clear, well-commented Python code that's easy to understand and explain.
+This is a **simplified, educational implementation** of a zero-knowledge password manager written in
+Python.
 
 ### Why This Project?
 

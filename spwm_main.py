@@ -1,56 +1,44 @@
+"""
+SecurePWM - Interactive Menu (Updated with username/site fields)
+"""
+
 import os
 import sys
 import getpass
-from pathlib import Path
-
+from datetime import datetime
 from securepwm.vault import Vault
 from securepwm.recovery import generate_recovery_shares, print_recovery_kit
 from securepwm import crypto
 
-from datetime import datetime
-
-# Try to reuse the same default path as the existing CLI, but fall back if import fails
 try:
     from securepwm.cli import DEFAULT_VAULT_PATH
-except Exception:  # safety fallback
+except Exception:
     DEFAULT_VAULT_PATH = os.path.join(os.path.expanduser("~"), ".securepwm", "vault.db")
 
-
-def clear_screen() -> None:
-    """Clear the terminal screen (best effort)."""
+def clear_screen():
     try:
         os.system("cls" if os.name == "nt" else "clear")
-    except Exception:
+    except:
         pass
 
-
-def pause() -> None:
+def pause():
     input("\nPress Enter to continue...")
 
-
-def choose_vault_path(current: str | None = None) -> str:
-    """Ask user which vault path to use."""
+def choose_vault_path(current=None):
     default = current or DEFAULT_VAULT_PATH
     print(f"Vault file path [{default}]: ", end="")
-    path = input().strip() or default
-    return path
+    return input().strip() or default
 
+def ensure_vault_dir(path):
+    d = os.path.dirname(path)
+    if d and not os.path.exists(d):
+        os.makedirs(d, exist_ok=True)
 
-def ensure_vault_dir(path: str) -> None:
-    """Make sure the directory for the vault exists."""
-    directory = os.path.dirname(path)
-    if directory and not os.path.exists(directory):
-        os.makedirs(directory, exist_ok=True)
-
-
-def unlock_flow(vault_path: str) -> Vault | None:
-    """Prompt for master password and unlock the vault at the given path."""
+def unlock_flow(vault_path):
     if not os.path.exists(vault_path):
         print(f"\nERROR: Vault not found at {vault_path}")
-        print("Create one first from the menu.")
         pause()
         return None
-
     password = getpass.getpass("\nMaster password: ")
     vault = Vault(vault_path)
     try:
@@ -63,315 +51,410 @@ def unlock_flow(vault_path: str) -> Vault | None:
         pause()
         return None
 
+def require_unlocked(vault, vault_path):
+    return vault if vault else unlock_flow(vault_path)
 
-def require_unlocked(vault: Vault | None, vault_path: str) -> Vault | None:
-    """
-    Make sure we have an unlocked vault.
-    If not, try to unlock the current vault_path.
-    """
-    if vault is not None:
-        return vault
-    return unlock_flow(vault_path)
-
-
-def cmd_init(vault_path: str) -> tuple[Vault | None, str]:
+def cmd_init(vault_path):
     clear_screen()
     print("=== Initialize New Vault ===\n")
-
     vault_path = choose_vault_path(vault_path)
-
     if os.path.exists(vault_path):
-        print(f"\nA vault already exists at:\n  {vault_path}")
-        print("If you really want to overwrite it, delete it manually first.")
+        print(f"\nVault exists at: {vault_path}")
         pause()
         return None, vault_path
-
-    # Get master password
     while True:
-        password = getpass.getpass("Enter master password: ")
-        password2 = getpass.getpass("Confirm master password: ")
-
-        if password != password2:
-            print("Passwords don't match. Try again.\n")
+        pw = getpass.getpass("Enter master password: ")
+        pw2 = getpass.getpass("Confirm: ")
+        if pw != pw2:
+            print("Passwords don't match.\n")
             continue
-
-        if len(password) < 8:
-            print("Password too short. Use at least 8 characters.\n")
+        if len(pw) < 8:
+            print("Too short (min 8 chars).\n")
             continue
-
         break
-
     ensure_vault_dir(vault_path)
-
-    print("\nInitializing vault (deriving keys, this may take a moment)...")
+    print("\nInitializing...")
     vault = Vault(vault_path)
-    try:
-        vault_id = vault.initialize(password)
-    except Exception as e:
-        print(f"\nERROR: Failed to initialize vault: {e}")
-        pause()
-        return None, vault_path
-
-    print(f"\n✓ Vault created successfully!")
-    print(f"  Vault ID: {vault_id}")
-    print(f"  Location: {vault_path}")
-    print("\nIMPORTANT: Your master password is NOT stored anywhere.")
-    print("If you forget it, you'll need recovery shares to regain access.")
-    print("\nNext steps:")
-    print("  1. Create recovery kit (option 7 in the menu)")
-    print("  2. Add your first password (options 2 or 3 in the menu)")
+    vid = vault.initialize(pw)
+    print(f"\n✓ Vault created! ID: {vid}")
     pause()
-
-    # Keep vault unlocked so user can start using it right away
     return vault, vault_path
 
-
-def cmd_add_manual(vault: Vault | None, vault_path: str) -> Vault | None:
+def cmd_add_manual(vault, vault_path):
     clear_screen()
     print("=== Add New Entry (Manual) ===\n")
     vault = require_unlocked(vault, vault_path)
-    if vault is None:
+    if not vault:
         return None
-
-    secret = getpass.getpass("Enter secret to store: ")
-    if not secret:
-        print("No secret entered, cancelled.")
+    username = input("Username (required): ").strip()
+    if not username:
+        print("Username required.")
         pause()
         return vault
-
+    site = input("Site/URL (optional): ").strip() or None
+    secret = getpass.getpass("Secret/Password: ")
+    if not secret:
+        print("Cancelled.")
+        pause()
+        return vault
     try:
-        entry_id = vault.add_entry(secret.encode("utf-8"))
-        print(f"\n✓ Entry added successfully!")
-        print(f"  Entry ID: {entry_id}")
-        print("\nYou can retrieve it later via option 5 (Get entry).")
+        eid = vault.add_entry(secret.encode('utf-8'), username, site)
+        print(f"\n✓ Added! ID: {eid}")
     except Exception as e:
-        print(f"\nERROR: {e}")
+        print(f"ERROR: {e}")
     pause()
     return vault
 
-
-def cmd_add_generated(vault: Vault | None, vault_path: str) -> Vault | None:
+def cmd_add_generated(vault, vault_path):
     clear_screen()
-    print("=== Add New Entry (Generated Password) ===\n")
+    print("=== Add New Entry (Generated) ===\n")
     vault = require_unlocked(vault, vault_path)
-    if vault is None:
+    if not vault:
         return None
-
+    username = input("Username (required): ").strip()
+    if not username:
+        print("Username required.")
+        pause()
+        return vault
+    site = input("Site/URL (optional): ").strip() or None
     try:
-        length_str = input("Password length [20]: ").strip()
-        length = int(length_str) if length_str else 20
-    except ValueError:
-        print("Invalid length, using default 20.")
+        length = int(input("Password length [20]: ").strip() or 20)
+    except:
         length = 20
-
-    use_symbols_input = input("Include symbols? [Y/n]: ").strip().lower()
-    use_symbols = not (use_symbols_input == "n" or use_symbols_input == "no")
-
-    password = crypto.generate_password(length=length, use_symbols=use_symbols)
-    print(f"\nGenerated password:\n  {password}")
-    print("(This will be stored in the vault.)")
-
+    symbols = input("Include symbols? [Y/n]: ").strip().lower() not in ('n', 'no')
+    pw = crypto.generate_password(length, symbols)
+    print(f"\nGenerated: {pw}")
     try:
-        entry_id = vault.add_entry(password.encode("utf-8"))
-        print(f"\n✓ Entry added successfully!")
-        print(f"  Entry ID: {entry_id}")
+        eid = vault.add_entry(pw.encode('utf-8'), username, site)
+        print(f"\n✓ Added! ID: {eid}")
     except Exception as e:
-        print(f"\nERROR: {e}")
+        print(f"ERROR: {e}")
     pause()
     return vault
 
-
-def cmd_list_entries(vault: Vault | None, vault_path: str) -> Vault | None:
+def cmd_list_entries(vault, vault_path):
     clear_screen()
     print("=== List Entries ===\n")
     vault = require_unlocked(vault, vault_path)
-    if vault is None:
+    if not vault:
         return None
-
     try:
         entries = vault.list_entries()
         if not entries:
-            print("No entries in vault.")
+            print("No entries.")
         else:
-            print(f"Found {len(entries)} entries:\n")
-            for entry in entries:
-                created = datetime.fromtimestamp(entry["created_at"]).strftime(
-                    "%Y-%m-%d %H:%M"
-                )
-                print(f"  {entry['id']}")
-                print(f"    Created: {created}\n")
+            print(f"{'ID':<36}  {'Username':<20}  {'Site':<25}")
+            print("-" * 85)
+            for e in entries:
+                print(f"{e['id']:<36}  {e['username']:<20}  {e['site'] or '-':<25}")
+    except Exception as e:
+        print(f"ERROR: {e}")
+    pause()
+    return vault
+
+def cmd_get_entry(vault, vault_path):
+    clear_screen()
+    print("=== Get Entry ===\n")
+    vault = require_unlocked(vault, vault_path)
+    if not vault:
+        return None
+    eid = input("Entry ID: ").strip()
+    if not eid:
+        pause()
+        return vault
+    try:
+        e = vault.get_entry(eid)
+        print(f"\n  ID: {e['id']}")
+        print(f"  Username: {e['username']}")
+        print(f"  Site: {e['site'] or '-'}")
+        
+        # Ask what to do with the password
+        print("\nOptions:")
+        print("  1) Show password")
+        print("  2) Copy to clipboard (without showing)")
+        print("  3) Both")
+        print("  0) Cancel")
+        choice = input("\n> ").strip()
+        
+        secret_str = e['secret'].decode('utf-8')
+        
+        if choice == '1':
+            print(f"\n  Password: {secret_str}")
+        elif choice == '2':
+            try:
+                import pyperclip
+                pyperclip.copy(secret_str)
+                print("\n✓ Copied to clipboard!")
+            except ImportError:
+                print("\n(pyperclip not installed - run: pip install pyperclip)")
+        elif choice == '3':
+            print(f"\n  Password: {secret_str}")
+            try:
+                import pyperclip
+                pyperclip.copy(secret_str)
+                print("✓ Also copied to clipboard!")
+            except ImportError:
+                print("(pyperclip not installed for clipboard)")
+        else:
+            print("Cancelled.")
     except Exception as e:
         print(f"ERROR: {e}")
     pause()
     return vault
 
 
-def cmd_get_entry(vault: Vault | None, vault_path: str) -> Vault | None:
+def cmd_quick_copy(vault, vault_path):
+    """Copy password to clipboard without displaying it."""
     clear_screen()
-    print("=== Get Entry ===\n")
+    print("=== Quick Copy ===\n")
     vault = require_unlocked(vault, vault_path)
-    if vault is None:
+    if not vault:
         return None
+    
+    # Show list first for convenience
+    try:
+        entries = vault.list_entries()
+        if not entries:
+            print("No entries in vault.")
+            pause()
+            return vault
+        
+        print(f"{'#':<4}  {'Username':<20}  {'Site':<25}  {'ID (first 8)'}")
+        print("-" * 70)
+        for i, e in enumerate(entries, 1):
+            short_id = e['id'][:8]
+            print(f"{i:<4}  {e['username']:<20}  {e['site'] or '-':<25}  {short_id}...")
+        
+        print(f"\nEnter # (1-{len(entries)}) or full ID:")
+        choice = input("> ").strip()
+        
+        # Determine entry ID
+        if choice.isdigit() and 1 <= int(choice) <= len(entries):
+            eid = entries[int(choice) - 1]['id']
+        else:
+            eid = choice  # Assume it's a full/partial ID
+            # Try to match partial ID
+            matches = [e for e in entries if e['id'].startswith(eid)]
+            if len(matches) == 1:
+                eid = matches[0]['id']
+            elif len(matches) > 1:
+                print("Multiple matches. Please use full ID.")
+                pause()
+                return vault
+        
+        # Get and copy
+        e = vault.get_entry(eid)
+        try:
+            import pyperclip
+            pyperclip.copy(e['secret'].decode('utf-8'))
+            print(f"\n✓ Password for '{e['username']}' copied to clipboard!")
+        except ImportError:
+            print("\nERROR: pyperclip not installed. Run: pip install pyperclip")
+            print(f"Password: {e['secret'].decode('utf-8')}")
+    except Exception as e:
+        print(f"ERROR: {e}")
+    pause()
+    return vault
 
-    entry_id = input("Entry ID: ").strip()
-    if not entry_id:
-        print("No entry ID provided, cancelled.")
+def cmd_search(vault, vault_path):
+    clear_screen()
+    print("=== Search Entries ===\n")
+    vault = require_unlocked(vault, vault_path)
+    if not vault:
+        return None
+    query = input("Search (username or site): ").strip()
+    if not query:
+        print("No search term entered.")
         pause()
         return vault
-
-    try:
-        secret = vault.get_entry(entry_id)
-        secret_str = secret.decode("utf-8")
-        print(f"\nSecret:\n  {secret_str}")
-
-        copy = input("\nCopy to clipboard? [y/N]: ").strip().lower()
-        if copy in ("y", "yes"):
-            try:
-                import pyperclip
-
-                pyperclip.copy(secret_str)
-                print("(Copied to clipboard)")
-            except ImportError:
-                print("(Install 'pyperclip' for clipboard support)")
-    except Exception as e:
-        print(f"\nERROR: {e}")
+    entries = vault.search(query)
+    if not entries:
+        print("\nNo matches found.")
+    else:
+        print(f"\nFound {len(entries)} entries:\n")
+        print(f"{'ID':<36}  {'Username':<20}  {'Site':<25}")
+        print("-" * 85)
+        for e in entries:
+            print(f"{e['id']:<36}  {e['username']:<20}  {e['site'] or '-':<25}")
     pause()
     return vault
 
 
-def cmd_verify(vault: Vault | None, vault_path: str) -> Vault | None:
+def cmd_delete(vault, vault_path):
+    clear_screen()
+    print("=== Delete Entry ===\n")
+    vault = require_unlocked(vault, vault_path)
+    if not vault:
+        return None
+    
+    # Show list first
+    try:
+        entries = vault.list_entries()
+        if not entries:
+            print("No entries in vault.")
+            pause()
+            return vault
+        
+        print(f"{'#':<4}  {'Username':<20}  {'Site':<25}  {'ID (first 8)'}")
+        print("-" * 70)
+        for i, e in enumerate(entries, 1):
+            short_id = e['id'][:8]
+            print(f"{i:<4}  {e['username']:<20}  {e['site'] or '-':<25}  {short_id}...")
+        
+        print(f"\nEnter # (1-{len(entries)}) or full ID to delete:")
+        choice = input("> ").strip()
+        
+        if not choice:
+            print("Cancelled.")
+            pause()
+            return vault
+        
+        # Determine entry ID
+        if choice.isdigit() and 1 <= int(choice) <= len(entries):
+            eid = entries[int(choice) - 1]['id']
+            entry_info = entries[int(choice) - 1]
+        else:
+            eid = choice
+            matches = [e for e in entries if e['id'].startswith(eid)]
+            if len(matches) == 1:
+                eid = matches[0]['id']
+                entry_info = matches[0]
+            elif len(matches) > 1:
+                print("Multiple matches. Please use full ID.")
+                pause()
+                return vault
+            else:
+                print("Entry not found.")
+                pause()
+                return vault
+        
+        # Confirm
+        print(f"\nAbout to delete:")
+        print(f"  Username: {entry_info['username']}")
+        print(f"  Site: {entry_info['site'] or '-'}")
+        print(f"  ID: {eid}")
+        
+        confirm = input("\nType 'yes' to confirm: ").strip().lower()
+        if confirm != 'yes':
+            print("Cancelled.")
+            pause()
+            return vault
+        
+        hard = input("Permanently delete? [y/N]: ").strip().lower() == 'y'
+        vault.delete_entry(eid, hard=hard)
+        print(f"\n✓ Entry deleted{'(permanently)' if hard else ''}.")
+    except Exception as e:
+        print(f"ERROR: {e}")
+    pause()
+    return vault
+
+def cmd_verify(vault, vault_path):
     clear_screen()
     print("=== Verify Audit Log ===\n")
     vault = require_unlocked(vault, vault_path)
-    if vault is None:
+    if not vault:
         return None
-
     try:
         if vault.verify_audit_log():
-            print("✓ Audit log is intact!")
-            print("  No tampering detected.")
+            print("✓ Audit log intact!")
         else:
-            print("✗ AUDIT LOG HAS BEEN TAMPERED!")
-            print("  The vault may have been compromised.")
+            print("✗ TAMPERED!")
     except Exception as e:
-        print(f"\nERROR: {e}")
+        print(f"ERROR: {e}")
     pause()
     return vault
 
-
-def cmd_recovery_create(vault: Vault | None, vault_path: str) -> Vault | None:
+def cmd_recovery_create(vault, vault_path):
     clear_screen()
     print("=== Create Recovery Kit ===\n")
     vault = require_unlocked(vault, vault_path)
-    if vault is None:
+    if not vault:
         return None
-
-    # Threshold and total shares
     try:
-        k_str = input("Threshold (shares needed) [3]: ").strip()
-        n_str = input("Total shares to create [5]: ").strip()
-        k = int(k_str) if k_str else 3
-        n = int(n_str) if n_str else 5
-    except ValueError:
-        print("Invalid numbers, using default k=3, n=5.")
+        k = int(input("Threshold [3]: ").strip() or 3)
+        n = int(input("Total shares [5]: ").strip() or 5)
+    except:
         k, n = 3, 5
-
-    if k > n:
-        print("ERROR: Threshold k cannot be greater than total shares n.")
-        pause()
-        return vault
-
-    # Output file
-    default_output = "recovery_kit.txt"
-    output_file = input(f"Output file [{default_output}]: ").strip() or default_output
-
+    out = input("Output file [recovery_kit.txt]: ").strip() or "recovery_kit.txt"
     try:
-        print(f"\nGenerating {n} shares (need {k} to recover)...")
         shares = generate_recovery_shares(vault.recovery_key, k, n)
-        kit_text = print_recovery_kit(shares, vault.vault_id, k)
-
-        with open(output_file, "w", encoding="utf-8") as f:
-            f.write(kit_text)
-
-        print(f"\n✓ Recovery kit saved to: {output_file}")
-        print("\nIMPORTANT:")
-        print("  - Print this file and store shares in separate locations")
-        print("  - You need the threshold number of shares to recover")
-        print("  - DELETE THIS FILE after printing!")
+        kit = print_recovery_kit(shares, vault.vault_id, k)
+        with open(out, 'w') as f:
+            f.write(kit)
+        print(f"\n✓ Saved to: {out}")
     except Exception as e:
-        print(f"\nERROR: {e}")
+        print(f"ERROR: {e}")
     pause()
     return vault
 
-
-def cmd_lock(vault: Vault | None) -> None:
+def cmd_lock(vault):
     clear_screen()
     print("=== Lock Vault ===\n")
-    if vault is not None:
+    if vault:
         vault.lock()
-        print("✓ Vault locked and database connection closed.")
+        print("✓ Locked.")
     else:
-        print("Vault is already locked / not opened.")
+        print("Not open.")
     pause()
 
-
-def main_menu() -> None:
-    vault: Vault | None = None
-    vault_path: str = DEFAULT_VAULT_PATH
-
+def main_menu():
+    vault = None
+    vault_path = DEFAULT_VAULT_PATH
     while True:
         clear_screen()
         print("SecurePWM - Interactive Menu")
         print("=" * 40)
-        print(f"Current vault: {vault_path}")
-        print(f"Status: {'UNLOCKED' if vault is not None else 'LOCKED/NOT OPEN'}")
-        print("\nChoose an option:")
-        print(" 1) Initialize new vault")
-        print(" 2) Add password (manual)")
-        print(" 3) Add password (generated)")
+        print(f"Vault: {vault_path}")
+        print(f"Status: {'UNLOCKED' if vault else 'LOCKED'}")
+        print("\n 1) Initialize vault")
+        print(" 2) Add entry (manual)")
+        print(" 3) Add entry (generated)")
         print(" 4) List entries")
-        print(" 5) Get entry")
-        print(" 6) Verify audit log")
-        print(" 7) Create recovery kit")
-        print(" 8) Change vault file path")
-        print(" 9) Lock vault")
+        print(" 5) Get entry (view details)")
+        print(" 6) Quick copy (copy password)")
+        print(" 7) Search entries")
+        print(" 8) Delete entry")
+        print(" 9) Verify audit log")
+        print("10) Create recovery kit")
+        print("11) Change vault path")
+        print("12) Lock vault")
         print(" 0) Exit")
-        choice = input("\n> ").strip()
-
-        if choice == "1":
+        c = input("\n> ").strip()
+        if c == '1':
             vault, vault_path = cmd_init(vault_path)
-        elif choice == "2":
+        elif c == '2':
             vault = cmd_add_manual(vault, vault_path)
-        elif choice == "3":
+        elif c == '3':
             vault = cmd_add_generated(vault, vault_path)
-        elif choice == "4":
+        elif c == '4':
             vault = cmd_list_entries(vault, vault_path)
-        elif choice == "5":
+        elif c == '5':
             vault = cmd_get_entry(vault, vault_path)
-        elif choice == "6":
+        elif c == '6':
+            vault = cmd_quick_copy(vault, vault_path)
+        elif c == '7':
+            vault = cmd_search(vault, vault_path)
+        elif c == '8':
+            vault = cmd_delete(vault, vault_path)
+        elif c == '9':
             vault = cmd_verify(vault, vault_path)
-        elif choice == "7":
+        elif c == '10':
             vault = cmd_recovery_create(vault, vault_path)
-        elif choice == "8":
-            print("\nChange vault path")
+        elif c == '11':
             vault_path = choose_vault_path(vault_path)
             pause()
-        elif choice == "9":
+        elif c == '12':
             cmd_lock(vault)
             vault = None
-        elif choice == "0":
-            if vault is not None:
+        elif c == '0':
+            if vault:
                 vault.lock()
             print("\nGoodbye!")
             break
-        else:
-            print("Invalid choice.")
-            pause()
-
 
 if __name__ == "__main__":
     try:
         main_menu()
     except KeyboardInterrupt:
-        print("\n\nInterrupted. Exiting...")
+        print("\nExiting...")
         sys.exit(0)
