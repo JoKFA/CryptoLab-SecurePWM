@@ -31,7 +31,7 @@ def test_kdf():
     key3 = crypto.derive_vault_key("different_password", salt)
     assert key1 != key3, "Different passwords should give different keys"
 
-    print("  ✓ KDF works correctly")
+    print("  [OK] KDF works correctly")
 
 
 def test_encryption():
@@ -49,7 +49,7 @@ def test_encryption():
     decrypted = crypto.decrypt(key, nonce, ciphertext, ad)
 
     assert decrypted == plaintext, "Decryption should recover plaintext"
-    print("  ✓ Encryption/decryption works")
+    print("  [OK] Encryption/decryption works")
 
     # Test tampering detection
     try:
@@ -59,7 +59,7 @@ def test_encryption():
         crypto.decrypt(key, nonce, bytes(tampered), ad)
         assert False, "Should have detected tampering"
     except Exception:
-        print("  ✓ Tampering detection works")
+        print("  [OK] Tampering detection works")
 
     # Test wrong AD
     try:
@@ -67,7 +67,7 @@ def test_encryption():
         crypto.decrypt(key, nonce, ciphertext, wrong_ad)
         assert False, "Should have rejected wrong AD"
     except Exception:
-        print("  ✓ Associated data validation works")
+        print("  [OK] Associated data validation works")
 
 
 def test_envelope_encryption():
@@ -76,16 +76,21 @@ def test_envelope_encryption():
 
     content_key = os.urandom(32)
     entry_key = crypto.create_entry_key()
+    vault_id = "test-vault-123"
     entry_id = "test-entry-123"
 
-    # Wrap entry key
-    nonce, wrapped = crypto.wrap_entry_key(content_key, entry_key, entry_id)
+    # Wrap entry key (with full AD)
+    nonce, wrapped = crypto.wrap_entry_key(
+        content_key, entry_key, vault_id, entry_id, schema_version=1, entry_version=1
+    )
 
     # Unwrap entry key
-    unwrapped = crypto.unwrap_entry_key(content_key, nonce, wrapped, entry_id)
+    unwrapped = crypto.unwrap_entry_key(
+        content_key, nonce, wrapped, vault_id, entry_id, schema_version=1, entry_version=1
+    )
 
     assert unwrapped == entry_key, "Unwrapping should recover entry key"
-    print("  ✓ Envelope encryption works")
+    print("  [OK] Envelope encryption works")
 
 
 def test_audit_chain():
@@ -93,26 +98,28 @@ def test_audit_chain():
     print("Testing Audit Chain...")
 
     audit_key = os.urandom(32)
+    import time
+    ts = int(time.time())
 
-    # Create chain of 3 entries
-    mac1 = crypto.compute_audit_mac(audit_key, 1, "INIT", None)
-    mac2 = crypto.compute_audit_mac(audit_key, 2, "ADD", mac1)
-    mac3 = crypto.compute_audit_mac(audit_key, 3, "GET", mac2)
+    # Create chain of 3 entries (now includes timestamp and payload)
+    mac1 = crypto.compute_audit_mac(audit_key, 1, ts, "INIT", None, None)
+    mac2 = crypto.compute_audit_mac(audit_key, 2, ts+1, "ADD", mac1, None)
+    mac3 = crypto.compute_audit_mac(audit_key, 3, ts+2, "GET", mac2, None)
 
     entries = [
-        {"seq": 1, "action": "INIT", "prev_mac": None, "mac": mac1},
-        {"seq": 2, "action": "ADD", "prev_mac": mac1, "mac": mac2},
-        {"seq": 3, "action": "GET", "prev_mac": mac2, "mac": mac3},
+        {"seq": 1, "ts": ts, "action": "INIT", "payload": None, "prev_mac": None, "mac": mac1},
+        {"seq": 2, "ts": ts+1, "action": "ADD", "payload": None, "prev_mac": mac1, "mac": mac2},
+        {"seq": 3, "ts": ts+2, "action": "GET", "payload": None, "prev_mac": mac2, "mac": mac3},
     ]
 
     # Verify chain
     assert crypto.verify_audit_chain(audit_key, entries), "Chain should be valid"
-    print("  ✓ Audit chain verification works")
+    print("  [OK] Audit chain verification works")
 
     # Tamper with middle entry
     entries[1]["action"] = "TAMPERED"
     assert not crypto.verify_audit_chain(audit_key, entries), "Should detect tampering"
-    print("  ✓ Tampering detection works")
+    print("  [OK] Tampering detection works")
 
 
 def test_vault_operations():
@@ -128,31 +135,31 @@ def test_vault_operations():
         vault = Vault(db_path)
         vault_id = vault.initialize("test_master_password")
         assert vault_id, "Should return vault ID"
-        print("  ✓ Vault initialization works")
+        print("  [OK] Vault initialization works")
 
         # Add entry
         entry_id = vault.add_entry(b"my_secret_password")
         assert entry_id, "Should return entry ID"
-        print("  ✓ Adding entry works")
+        print("  [OK] Adding entry works")
 
         # Get entry
         secret = vault.get_entry(entry_id)
         assert secret == b"my_secret_password", "Should retrieve correct secret"
-        print("  ✓ Getting entry works")
+        print("  [OK] Getting entry works")
 
         # List entries
         entries = vault.list_entries()
         assert len(entries) == 1, "Should have 1 entry"
-        print("  ✓ Listing entries works")
+        print("  [OK] Listing entries works")
 
         # Verify audit log
         assert vault.verify_audit_log(), "Audit log should be valid"
-        print("  ✓ Audit log verification works")
+        print("  [OK] Audit log verification works")
 
         # Lock and unlock
         vault.lock()
         vault.unlock("test_master_password")
-        print("  ✓ Lock/unlock works")
+        print("  [OK] Lock/unlock works")
 
         # Wrong password
         vault.lock()
@@ -162,7 +169,7 @@ def test_vault_operations():
             vault.get_entry(entry_id)
             assert False, "Should fail with wrong password"
         except Exception:
-            print("  ✓ Wrong password detection works")
+            print("  [OK] Wrong password detection works")
 
     finally:
         # Cleanup
@@ -179,24 +186,24 @@ def test_recovery():
     # Generate 3-of-5 shares
     shares = generate_recovery_shares(recovery_key, k=3, n=5)
     assert len(shares) == 5, "Should generate 5 shares"
-    print("  ✓ Share generation works")
+    print("  [OK] Share generation works")
 
     # Recover with 3 shares (shares 0, 2, 4)
     recovered = combine_recovery_shares([shares[0], shares[2], shares[4]])
     assert recovered == recovery_key, "Should recover original key"
-    print("  ✓ Recovery from k shares works")
+    print("  [OK] Recovery from k shares works")
 
     # Try with different 3 shares (1, 3, 4)
     recovered2 = combine_recovery_shares([shares[1], shares[3], shares[4]])
     assert recovered2 == recovery_key, "Should work with any k shares"
-    print("  ✓ Any k shares work")
+    print("  [OK] Any k shares work")
 
     # Try with only 2 shares (should fail)
     try:
         combine_recovery_shares([shares[0], shares[1]])
         assert False, "Should require at least k shares"
     except Exception:
-        print("  ✓ Insufficient shares rejected")
+        print("  [OK] Insufficient shares rejected")
 
 
 def test_password_generation():
@@ -212,7 +219,7 @@ def test_password_generation():
     pwd_no_sym = crypto.generate_password(length=16, use_symbols=False)
     assert len(pwd_no_sym) == 16
     assert all(c.isalnum() for c in pwd_no_sym), "Should be alphanumeric only"
-    print("  ✓ Password generation works")
+    print("  [OK] Password generation works")
 
 
 def run_all_tests():
@@ -239,15 +246,15 @@ def run_all_tests():
             test()
             print()
         except Exception as e:
-            print(f"  ✗ TEST FAILED: {e}")
+            print(f"  [FAIL] TEST FAILED: {e}")
             failed.append((test.__name__, e))
             print()
 
     print("=" * 70)
     if not failed:
-        print("✓ ALL TESTS PASSED!")
+        print("[OK] ALL TESTS PASSED!")
     else:
-        print(f"✗ {len(failed)} TESTS FAILED:")
+        print(f"[FAIL] {len(failed)} TESTS FAILED:")
         for name, error in failed:
             print(f"  - {name}: {error}")
     print("=" * 70)
